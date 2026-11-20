@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# orbctl — inspect and manipulate KVM orbs by hand: save, fork, restore states.
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+usage() {
+	cat <<'EOF'
+usage: orbctl <command> [args]
+
+  ls                                  orbs, snapshots, images, disk usage
+  start ORB [--type T] [--image IMG] [--from SNAP]
+                                      boot (or resume) an orb; creates it if missing
+  stop ORB [--no-memory]              pause: save RAM + disk (or shut down cleanly)
+  rm ORB                              delete an orb and its private overlay
+  bootstrap ORB                       run `amp orb bootstrap` (needs ORB_TOKEN)
+
+  save ORB SNAP [--memory]            freeze the orb's current disk (and RAM) as
+                                      snapshot SNAP; works live, no disk copy
+  fork SRC NEW [--memory] [--type T] [--no-start]
+                                      new orb from snapshot SRC, or from the
+                                      current state of orb SRC
+  restore ORB SNAP [--memory]         reset an orb to a snapshot (drops changes)
+  snapshots                           list snapshots
+  rmsnap SNAP                         delete a snapshot record (layers: see gc)
+
+  exec ORB [-r] [-t SECS] -- CMD...   run a command in the guest (as the image
+                                      user, or root with -r)
+  console ORB                         serial console (Ctrl-] to detach)
+  log ORB                             follow the serial console log
+  layers ORB|SNAP                     show the qcow2 backing chain
+  gc [-n]                             delete layers/kernels nothing refers to
+  build-image [--pull] [--force] [IMG]
+EOF
+}
+
+with_orb() { ORB_ID=$1; orb_paths "$1"; }
+require_orb() { with_orb "$1"; orb_exists || die "no such orb: $1"; }
+
+orb_state() {
+	if orb_running; then
+		qmp_status 2>/dev/null || echo running
+	elif memstate >/dev/null; then
+		echo saved
+	else
+		echo stopped
+	fi
+}
+
+cmd_ls() {
+	local d n
+	printf '%-44s %-9s %4s %5s %7s %5s  %s\n' ORB STATE CPU MEM DISK DEPTH SOURCE
+	for d in "$ORBS"/*/; do
+		n=$(basename "$d")
+		[[ -f $d/vm.env ]] || continue
+		ORB_ID=$n
+		orb_paths "$n"
+		load_vm_env
+		printf '%-44s %-9s %4s %5s %7s %5s  %s\n' "$n" "$(orb_state)" "$CPUS" "$MEM" \
+			"$(du -h "$(readlink -f "$d/disk.qcow2")" | cut -f1)" "$(chain_depth "$d/disk.qcow2")" "$SOURCE"
+	done
+	echo
+	cmd_snapshots
+	echo
+	printf '%-60s %-14s %s\n' IMAGE LAYER BUILT
+	for d in "$IMAGES"/*/image.env; do
+		printf '%-60s %-14s %s\n' "$(kv_get "$d" IMAGE)" "$(kv_get "$d" LAYER | cut -c1-14)" "$(kv_get "$d" BUILT)"
+	done
+	echo
+	echo "disk: layers $(du -sh "$LAYERS" | cut -f1), orbs $(du -sh "$ORBS" | cut -f1), snapshots $(du -sh "$SNAPS" | cut -f1)"
+}
+
+cmd_snapshots() {
+	local f
+	printf '%-44s %-6s %-21s %s\n' SNAPSHOT MEMORY CREATED ORIGIN
+	for f in "$SNAPS"/*/snap.env; do
+		printf '%-44s %-6s %-21s %s\n' "$(kv_get "$f" NAME)" "$(kv_get "$f" MEMORY)" "$(kv_get "$f" CREATED)" "$(kv_get "$f" ORIGIN)"
+	done
+}
+
+cmd_start() {
+	local orb=$1 type='' image='' from=''
+	shift
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+		--type) type=$2; shift 2 ;;
+		--image) image=$2; shift 2 ;;
+		--from) from=$2; shift 2 ;;
+		*) die "unknown option $1" ;;
+		esac
+	done
+	with_orb "$orb"
+	lock "orb-$OKEY"
+	if ! orb_exists; then
+		rm -rf "$ODIR"
+		if [[ -n $from ]]; then
+			snap_exists "$from" || die "no such snapshot: $from"
+			orb_create_from_snapshot "$from" "$type" 1
+		else
+			orb_create_from_image "${image:-${ORB_IMAGE:-$ORB_DEFAULT_IMAGE}}" "$type"
+		fi
+	fi
+	orb_up
+	log "up"
+}
+
+cmd_stop() {
+	local mem=$ORB_SAVE_MEMORY
+	[[ ${2-} == --no-memory ]] && mem=0
+	require_orb "$1"
+	lock "orb-$OKEY"
+	orb_down "$mem"
+	log "stopped ($(orb_state))"
+}
+
+cmd_rm() {
+	with_orb "$1"
+	lock "orb-$OKEY"
+	qemu_kill
+	rm -rf "$ODIR" "$RDIR"
+	log "deleted"
+}
+
+cmd_bootstrap() {
+	: "${ORB_TOKEN:?set ORB_TOKEN}"
+	require_orb "$1"
+	lock "orb-$OKEY"
+	orb_running || die "orb is not running"
+	guest_bootstrap
+}
+
+cmd_save() {
+	local orb=$1 snap=$2 mem=0
+	[[ ${3-} == --memory ]] && mem=1
+	require_orb "$orb"
+	lock "orb-$OKEY"
+	if orb_running; then
+		snapshot_live "$snap" "$mem"
+	else
+		if [[ $mem == 1 ]] && ! memstate >/dev/null; then
+			log "orb is stopped without saved RAM; snapshot will be disk-only"
+		fi
+		snapshot_offline "$snap" "$mem"
+	fi
+}
+
+cmd_fork() {
+	local src=$1 new=$2 mem=0 type='' start=1 snap
+	shift 2
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+		--memory) mem=1; shift ;;
+		--type) type=$2; shift 2 ;;
+		--no-start) start=0; shift ;;
+		*) die "unknown option $1" ;;
+		esac
+	done
+	if snap_exists "$src"; then
+		snap=$src
+	else
+		with_orb "$src"
+		orb_exists || die "no orb or snapshot named $src"
+		snap="fork-of-$src-$(date -u +%Y%m%d%H%M%S)"
+		(cmd_save "$src" "$snap" "$([[ $mem == 1 ]] && echo --memory)") || die "could not save $src"
+	fi
+	with_orb "$new"
+	lock "orb-$OKEY"
+	orb_exists && die "orb $new already exists"
+	rm -rf "$ODIR"
+	orb_create_from_snapshot "$snap" "$type" "$mem"
+	[[ $start == 0 ]] || { orb_up; log "up"; }
+	if [[ $mem == 1 ]]; then
+		log "note: a memory fork also resumes the source's processes (including any amp orb bootstrap)"
+	fi
+}
+
+cmd_restore() {
+	local orb=$1 snap=$2 mem=0 sd was_running=0
+	[[ ${3-} == --memory ]] && mem=1
+	snap_exists "$snap" || die "no such snapshot: $snap"
+	sd=$(snap_dir "$snap")
+	require_orb "$orb"
+	lock "orb-$OKEY"
+	orb_running && was_running=1
+	qemu_kill
+	rm -f "$ODIR"/memory.state "$ODIR"/memory.state.zst
+	if [[ $mem == 1 && $(kv_get "$sd/snap.env" MEMORY) == 1 ]]; then
+		cp "$sd/vm.env" "$ODIR/vm.env"
+		for f in "$sd"/memory.state*; do ln -f "$f" "$ODIR/$(basename "$f")"; done
+		load_vm_env
+		SOURCE="snapshot:$snap"
+		save_vm_env
+	else
+		[[ $mem == 0 ]] || log "snapshot has no memory image; restoring disk only"
+		load_vm_env
+		KERNEL=$(kv_get "$sd/snap.env" KERNEL)
+		SOURCE="snapshot:$snap"
+		save_vm_env
+	fi
+	orb_new_top "$(layer_path "$(kv_get "$sd/snap.env" LAYER)")"
+	log "restored to $snap"
+	[[ $was_running == 0 ]] || { orb_up; log "up"; }
+}
+
+cmd_rmsnap() {
+	snap_exists "$1" || die "no such snapshot: $1"
+	rm -rf "$(snap_dir "$1")"
+	log "removed snapshot $1 (run 'orbctl gc' to free unused layers)"
+}
+
+cmd_exec() {
+	local orb=$1 root=0 t=600
+	shift
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+		-r) root=1; shift ;;
+		-t) t=$2; shift 2 ;;
+		--) shift; break ;;
+		*) break ;;
+		esac
+	done
+	[[ $# -gt 0 ]] || die "no command"
+	require_orb "$orb"
+	orb_running || die "orb is not running"
+	load_vm_env
+	if [[ $root == 1 ]]; then
+		guest_exec -t "$t" -- /bin/bash -lc "$(printf '%q ' "$@")"
+	else
+		guest_exec -t "$t" -- /sbin/runuser -l "${OUSER:-user}" -c "$(printf '%q ' "$@")"
+	fi
+}
+
+cmd_console() {
+	require_orb "$1"
+	orb_running || die "orb is not running"
+	echo "connected to $1 serial console; Ctrl-] to detach" >&2
+	socat "-,raw,echo=0,escape=0x1d" "UNIX-CONNECT:$SERIAL_SOCK"
+}
+
+cmd_log() { require_orb "$1"; tail -n 100 -F "$ODIR/console.log"; }
+
+cmd_layers() {
+	local f
+	if snap_exists "$1"; then
+		f=$(layer_path "$(kv_get "$(snap_dir "$1")/snap.env" LAYER)")
+	else
+		require_orb "$1"
+		f=$ODIR/disk.qcow2
+	fi
+	"$QEMU_IMG" info -U --backing-chain --output=json "$f" |
+		jq -r '.[] | "\(.filename)\t\(."actual-size" / 1048576 | floor)M"'
+}
+
+cmd_gc() {
+	local dry=0 f lid now
+	[[ ${1-} == -n ]] && dry=1
+	declare -A keep=() keepk=()
+	for f in "$ORBS"/*/disk.qcow2; do
+		while read -r l; do keep[$l]=1; done < <(chain "$f")
+		keepk[$(kv_get "$(dirname "$f")/vm.env" KERNEL)]=1
+	done
+	for f in "$SNAPS"/*/snap.env "$IMAGES"/*/image.env; do
+		while read -r l; do keep[$l]=1; done < <(chain "$(layer_path "$(kv_get "$f" LAYER)")")
+		keepk[$(kv_get "$f" KERNEL)]=1
+	done
+	for f in "$SNAPS"/*/vm.env; do keepk[$(kv_get "$f" KERNEL)]=1; done
+	now=$(date +%s)
+	for f in "$LAYERS"/*.qcow2; do
+		[[ -n ${keep[$f]-} ]] && continue
+		(($(stat -c %Z "$f") > now - ${ORB_GC_GRACE:-900})) && continue # may be mid-operation
+		echo "unused layer $(layer_id "$f") ($(du -h "$f" | cut -f1))"
+		[[ $dry == 1 ]] || rm -f "$f" "${f%.qcow2}.json"
+	done
+	for f in "$KERNELS"/*/; do
+		f=$(basename "$f")
+		[[ -n ${keepk[$f]-} || $f == *.tmp ]] && continue
+		echo "unused kernel $f"
+		[[ $dry == 1 ]] || rm -rf "${KERNELS:?}/$f"
+	done
+	[[ $dry == 1 ]] || rm -rf "$ORBS_HOME"/build "$SNAPS"/.tmp-* "$SNAPS"/.old-*
+}
+
+[[ $# -gt 0 ]] || { usage; exit 1; }
+cmd=$1
+shift
+case $cmd in
+ls | snapshots) need "$QEMU_IMG" jq; "cmd_$cmd" ;;
+start | stop | rm | bootstrap | save | fork | restore | rmsnap | exec | console | log | layers | gc)
+	need "$QEMU" "$QEMU_IMG" socat jq flock
+	"cmd_$cmd" "$@"
+	;;
+build-image) exec "$ORBSYS_DIR/build-image.sh" "$@" ;;
+-h | --help | help) usage ;;
+*) usage; exit 1 ;;
+esac

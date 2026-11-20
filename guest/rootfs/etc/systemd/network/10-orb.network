@@ -1,0 +1,9 @@
+# QEMU user-mode networking (slirp): outbound NAT only, no inbound ports.
+[Match]
+Name=eth0
+
+[Network]
+Address=10.0.2.15/24
+Gateway=10.0.2.2
+DNS=10.0.2.3
+IPv6AcceptRA=yes
